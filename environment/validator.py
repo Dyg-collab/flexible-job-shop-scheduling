@@ -1,108 +1,118 @@
-# sample schedule = (job_id, operation_id, machine_id, start_time)
+"""Independent FJSP schedule validator."""
 
-'''
-IDs => Does this job and operation exist?
+from __future__ import annotations
 
-Duplicate/missing => Is every operation scheduled exactly once?
+from typing import Iterable
 
-Machine eligibility => Is this operation allowed on that machine?
 
-Start time => Does it start at time ≥ 0?
+def validate_schedule(instance: dict, schedule: Iterable[tuple]) -> list[str]:
+    """Return a list of errors. An empty list means the schedule is valid."""
+    jobs = instance.get("jobs", [])
+    num_machines = instance.get("num_machines", 0)
+    errors: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    machine_intervals: dict[int, list[tuple[float, float, int, int]]] = {}
 
-Precedence => Does the previous operation finish before the next starts?
+    # Materialize once so later checks see exactly the same schedule.
+    schedule_list = list(schedule)
 
-Machine overlap => Is the machine free when this operation starts?
-'''
-
-def validate_schedule(instance, schedule):
-    jobs = instance["jobs"]
-    errors = []
-
-    # Track which operations are scheduled
-    seen = set()
-    machine_intervals = {}
-
-    # Check each scheduled operation
-    for job_id, op_id, machine_id, start in schedule:
-        operation = (job_id, op_id)
-
-        # Check job and operation IDs
-        if job_id < 0 or job_id >= len(jobs):
-            errors.append(f"Invalid job ID: {job_id}")
+    for index, item in enumerate(schedule_list):
+        if not isinstance(item, (tuple, list)) or len(item) != 4:
+            errors.append(f"Malformed schedule entry at index {index}: {item!r}")
             continue
 
-        if op_id < 0 or op_id >= len(jobs[job_id]):
+        job_id, op_id, machine_id, start = item
+
+        if not all(isinstance(x, int) for x in (job_id, op_id, machine_id)):
+            errors.append(f"Non-integer ID in schedule entry {index}: {item!r}")
+            continue
+        if not isinstance(start, (int, float)):
+            errors.append(f"Non-numeric start time in schedule entry {index}: {item!r}")
+            continue
+
+        if not 0 <= job_id < len(jobs):
+            errors.append(f"Invalid job ID: {job_id}")
+            continue
+        if not 0 <= op_id < len(jobs[job_id]):
             errors.append(f"Invalid operation ID: J{job_id} O{op_id}")
             continue
 
-        # Check duplicate operation
-        if operation in seen:
+        operation_key = (job_id, op_id)
+        if operation_key in seen:
             errors.append(f"Duplicate operation: J{job_id} O{op_id}")
             continue
-        seen.add(operation)
+        seen.add(operation_key)
 
-        # Check machine eligibility
         eligible = jobs[job_id][op_id]
-        if machine_id not in eligible:
-            errors.append(
-                f"J{job_id} O{op_id} cannot run on M{machine_id}"
-            )
+        if not 0 <= machine_id < num_machines:
+            errors.append(f"Invalid machine ID: {machine_id}")
             continue
-
-        # Check start time
+        if machine_id not in eligible:
+            errors.append(f"J{job_id} O{op_id} cannot run on M{machine_id}")
+            continue
         if start < 0:
             errors.append(f"Negative start time: J{job_id} O{op_id}")
+            continue
 
         duration = eligible[machine_id]
         end = start + duration
-
         machine_intervals.setdefault(machine_id, []).append(
             (start, end, job_id, op_id)
         )
 
-    # Check that every operation appears exactly once
+    # Every operation must appear exactly once.
     for job_id, job in enumerate(jobs):
         for op_id in range(len(job)):
             if (job_id, op_id) not in seen:
                 errors.append(f"Missing operation: J{job_id} O{op_id}")
 
-    # Check precedence: each operation must finish before the next starts
-    start_times = {
-        (j, o): start
-        for j, o, m, start in schedule
-        if 0 <= j < len(jobs) and 0 <= o < len(jobs[j])
-    }
+    # Build a direct mapping only from well-formed, valid entries.
+    entries = {}
+    for item in schedule_list:
+        if not isinstance(item, (tuple, list)) or len(item) != 4:
+            continue
+        job_id, op_id, machine_id, start = item
+        if not all(isinstance(x, int) for x in (job_id, op_id, machine_id)):
+            continue
+        if not isinstance(start, (int, float)):
+            continue
+        if not (0 <= job_id < len(jobs) and 0 <= op_id < len(jobs[job_id])):
+            continue
+        if not (0 <= machine_id < num_machines):
+            continue
+        if machine_id not in jobs[job_id][op_id] or start < 0:
+            continue
+        key = (job_id, op_id)
+        if key not in entries:
+            entries[key] = (machine_id, start)
 
+    # Precedence: operation i+1 cannot start before operation i finishes.
     for job_id, job in enumerate(jobs):
         for op_id in range(len(job) - 1):
             current = (job_id, op_id)
             next_op = (job_id, op_id + 1)
-
-            if current in start_times and next_op in start_times:
-                current_machine = schedule[
-                    next(i for i, item in enumerate(schedule)
-                         if item[0] == job_id and item[1] == op_id)
-                ][2]
-
-                current_end = (
-                    start_times[current]
-                    + job[op_id].get(current_machine, 0)
+            if current not in entries or next_op not in entries:
+                continue
+            current_machine, current_start = entries[current]
+            _, next_start = entries[next_op]
+            current_duration = job[op_id][current_machine]
+            current_end = current_start + current_duration
+            if next_start < current_end:
+                errors.append(
+                    f"Precedence violation: J{job_id} O{op_id + 1} "
+                    f"starts at {next_start} before J{job_id} O{op_id} finishes at {current_end}"
                 )
 
-                if start_times[next_op] < current_end:
-                    errors.append(
-                        f"Precedence violation: J{job_id} O{op_id + 1}"
-                    )
-
-    # Check machine overlap
+    # No two operations may overlap on the same machine.
     for machine_id, intervals in machine_intervals.items():
-        intervals.sort()
-
-        for i in range(1, len(intervals)):
-            previous_end = intervals[i - 1][1]
-            current_start = intervals[i][0]
-
+        intervals.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        for previous, current in zip(intervals, intervals[1:]):
+            previous_end = previous[1]
+            current_start = current[0]
             if current_start < previous_end:
-                errors.append(f"Machine overlap on M{machine_id}")
+                errors.append(
+                    f"Machine overlap on M{machine_id}: "
+                    f"J{previous[2]} O{previous[3]} overlaps J{current[2]} O{current[3]}"
+                )
 
     return errors
